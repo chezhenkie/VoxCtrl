@@ -84,8 +84,18 @@ jobs:
       - name: Verify installer payload
         shell: pwsh
         run: |
-          $setup = Get-ChildItem -Path "src-tauri/target/release/bundle/nsis" -Filter "*.exe" |
-            Select-Object -First 1
+          $setup = $null
+          foreach ($dir in @("target/release/bundle/nsis", "src-tauri/target/release/bundle/nsis")) {
+            if (Test-Path -LiteralPath $dir) {
+              $setup = Get-ChildItem -Path $dir -Filter "*.exe" | Select-Object -First 1
+              if ($setup) { break }
+            }
+          }
+          if (-not $setup) {
+            $setup = Get-ChildItem -Path . -Recurse -Filter "*-setup.exe" -File |
+              Where-Object { $_.FullName -like "*\bundle\nsis\*" } |
+              Select-Object -First 1
+          }
           if (-not $setup) { throw "No NSIS installer was produced" }
           Write-Host "Installer: $($setup.FullName) ($([math]::Round($setup.Length / 1MB, 1)) MB)"
 
@@ -118,8 +128,18 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path "upload" | Out-Null
-          $setup = Get-ChildItem -Path "src-tauri/target/release/bundle/nsis" -Filter "*.exe" |
-            Select-Object -First 1
+          $setup = $null
+          foreach ($dir in @("target/release/bundle/nsis", "src-tauri/target/release/bundle/nsis")) {
+            if (Test-Path -LiteralPath $dir) {
+              $setup = Get-ChildItem -Path $dir -Filter "*.exe" | Select-Object -First 1
+              if ($setup) { break }
+            }
+          }
+          if (-not $setup) {
+            $setup = Get-ChildItem -Path . -Recurse -Filter "*-setup.exe" -File |
+              Where-Object { $_.FullName -like "*\bundle\nsis\*" } |
+              Select-Object -First 1
+          }
           if (-not $setup) { throw "No NSIS installer was produced" }
           $name = "VoxCtrl_0.8.3_x64-setup-webgpu-dawn.exe"
           Copy-Item -LiteralPath $setup.FullName -Destination (Join-Path "upload" $name)
