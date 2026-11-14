@@ -1,0 +1,161 @@
+name: Windows WebGPU installer verification
+
+# Test-only workflow for the release.yml change in this fork. It runs the same
+# Windows GPU staging step and the same tauri command as release.yml on a clean
+# runner, then silently installs the NSIS bundle, checks the payload and starts
+# the installed exe. It does not sign, tag or publish anything.
+#
+# The fix branch carries only the release.yml change; this file exists on the
+# test branch so the pull request stays scoped to the release workflow.
+
+on:
+  push:
+    branches:
+      - test/windows-webgpu-dawn-v2
+  workflow_dispatch:
+
+concurrency:
+  group: windows-webgpu-installer-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-installer:
+    name: Build and verify Windows installer
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same Rust and Node versions as release.yml. Rust is pinned there
+      # because tauri-build 2.6.2 breaks on cargo 1.100's build directory
+      # layout.
+      - uses: dtolnay/rust-toolchain@1.99.1
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-webgpu-installer-v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm install
+
+      # Copy of "Stage Dawn DLLs (Windows, GPU)" from release.yml with the
+      # matrix features written out. Keep the two in sync.
+      - name: Stage Dawn DLLs (Windows, GPU)
+        shell: pwsh
+        run: |
+          npm run build
+          cargo build --release -p voxctrl-app --features moonshine-webgpu,parakeet-webgpu
+
+          $dlls = @("webgpu_dawn.dll", "dxcompiler.dll", "dxil.dll")
+          New-Item -ItemType Directory -Force -Path "src-tauri/dawn" | Out-Null
+          foreach ($name in $dlls) {
+            $src = Join-Path "target/release" $name
+            if (-not (Test-Path -LiteralPath $src)) {
+              throw "$name was not staged into target/release by the WebGPU build"
+            }
+            Copy-Item -LiteralPath $src -Destination (Join-Path "src-tauri/dawn" $name) -Force
+          }
+
+          @{
+            bundle = @{
+              resources = @{
+                "dawn/webgpu_dawn.dll" = "webgpu_dawn.dll"
+                "dawn/dxcompiler.dll"  = "dxcompiler.dll"
+                "dawn/dxil.dll"        = "dxil.dll"
+              }
+            }
+          } | ConvertTo-Json -Depth 5 | Set-Content -Path "tauri-webgpu.conf.json" -Encoding utf8
+
+      - name: Build installer (Windows, GPU)
+        run: npx tauri build --bundles nsis --features moonshine-webgpu,parakeet-webgpu --config tauri-webgpu.conf.json
+
+      # Runs the installer the same way a user would, but silently, then checks
+      # the payload. A bundle that merely contains the DLLs is not enough: what
+      # matters is that they land next to voxctrl.exe after installation.
+      - name: Verify installer payload
+        shell: pwsh
+        run: |
+          $setup = $null
+          foreach ($dir in @("target/release/bundle/nsis", "src-tauri/target/release/bundle/nsis")) {
+            if (Test-Path -LiteralPath $dir) {
+              $setup = Get-ChildItem -Path $dir -Filter "*-setup.exe" | Select-Object -First 1
+              if ($setup) { break }
+            }
+          }
+          if (-not $setup) {
+            $setup = Get-ChildItem -Path . -Recurse -Filter "*-setup.exe" -File |
+              Where-Object { $_.FullName -like "*\bundle\nsis\*" } |
+              Select-Object -First 1
+          }
+          if (-not $setup) { throw "No NSIS installer was produced" }
+          Write-Host "Installer: $($setup.FullName) ($([math]::Round($setup.Length / 1MB, 1)) MB)"
+
+          $target = Join-Path $env:RUNNER_TEMP "voxctrl-install"
+          if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Recurse -Force }
+          $installArgs = @("/S", "/D=$target")
+          $process = Start-Process -FilePath $setup.FullName -ArgumentList $installArgs -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Installer exited with code $($process.ExitCode)" }
+
+          $required = @(
+            "voxctrl.exe",
+            "voxctrl-llm-sidecar.exe",
+            "webgpu_dawn.dll",
+            "dxcompiler.dll",
+            "dxil.dll"
+          )
+          foreach ($name in $required) {
+            $path = Join-Path $target $name
+            if (-not (Test-Path -LiteralPath $path)) { throw "$name is missing after installation" }
+            $item = Get-Item -LiteralPath $path
+            Write-Host ("present: {0} ({1} bytes)" -f $name, $item.Length)
+          }
+          Get-ChildItem -LiteralPath $target |
+            Select-Object Name, Length |
+            Format-Table -AutoSize |
+            Out-String |
+            Write-Host
+
+          # Windows resolves webgpu_dawn.dll before main(), so an exit code 0
+          # from --version proves the installed exe can start. It prints the
+          # version and exits before the GUI and the webview start.
+          $version = (Get-Content -Raw -LiteralPath "src-tauri/tauri.conf.json" | ConvertFrom-Json).version
+          $proc = Start-Process -FilePath (Join-Path $target "voxctrl.exe") -ArgumentList "--version" -Wait -PassThru
+          if ($proc.ExitCode -ne 0) {
+            throw "installed voxctrl.exe --version exited with code $($proc.ExitCode); the loader could not start the process"
+          }
+          Write-Host "launch check: voxctrl.exe --version exited 0 (expected version $version)"
+
+      - name: Collect installer
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "upload" | Out-Null
+          $setup = $null
+          foreach ($dir in @("target/release/bundle/nsis", "src-tauri/target/release/bundle/nsis")) {
+            if (Test-Path -LiteralPath $dir) {
+              $setup = Get-ChildItem -Path $dir -Filter "*-setup.exe" | Select-Object -First 1
+              if ($setup) { break }
+            }
+          }
+          if (-not $setup) {
+            $setup = Get-ChildItem -Path . -Recurse -Filter "*-setup.exe" -File |
+              Where-Object { $_.FullName -like "*\bundle\nsis\*" } |
+              Select-Object -First 1
+          }
+          if (-not $setup) { throw "No NSIS installer was produced" }
+          $version = (Get-Content -Raw -LiteralPath "src-tauri/tauri.conf.json" | ConvertFrom-Json).version
+          $name = "VoxCtrl_${version}_x64-setup-webgpu-dawn.exe"
+          Copy-Item -LiteralPath $setup.FullName -Destination (Join-Path "upload" $name)
+          Get-FileHash -LiteralPath (Join-Path "upload" $name) -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash)  $name" } |
+            Set-Content -Path "upload/SHA256SUMS.txt" -Encoding ascii
+          Get-ChildItem -LiteralPath "upload" | Select-Object Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VoxCtrl-windows-webgpu-installer
+          path: upload/*
+          if-no-files-found: error
